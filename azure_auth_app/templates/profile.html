@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+	<title>User Profile</title>
+</head>
+
+<body>
+	<h1>Welcome, {{ profile.displayName }}!</h1>
+	<p><strong>Email:</strong> {{ profile.userPrincipalName }}</p>
+	<p><strong>ID:</strong> {{ profile.id }}</p>
+
+	<h2>Token Information</h2>
+	<p><strong>Access Token:</strong> {{ tokens.access_token[:20] }}...</p>
+	<p><strong>Refresh Token:</strong> {{ tokens.refresh_token[:20] if tokens.refresh_token else "None" }}...</p>
+	<p><strong>Expires In:</strong> {{ tokens.expires_in if tokens.expires_in else "Unknown" }} seconds</p>
+
+	<br>
+	<a href="/logout"><button>Logout</button></a>
+</body>
+
+</html>
