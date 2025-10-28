@@ -59,21 +59,39 @@ class PermissionRiskAnalyzer:
         Returns:
             Formatted prompt string
         """
-        return f"""Analyze this Microsoft Graph API permission and assign a risk score from 1-5 (5 being highest risk).
+        return f"""You are a cybersecurity risk assessment specialist. Analyze the provided Microsoft Graph API permission and assign a comprehensive risk score from 1-5, where:
+- 1: Minimal risk (public data, read-only)
+- 2: Low risk (limited read access)
+- 3: Moderate risk (broad read or limited write access)
+- 4: High risk (sensitive data write access)
+- 5: Critical risk (full administrative control)
 
-Permission: {json.dumps(permission_data, indent=2)}
+**Assessment Framework:**
+Evaluate the permission based on these risk factors:
 
-Consider factors like:
-- Data access scope and sensitivity
-- Potential for privilege escalation
-- Impact if misused
-- Common attack vectors
+1. **Data Sensitivity & Scope**
+   - What types of data can be accessed (PII, credentials, organizational data)?
+   - Is access limited to user's own data or broader organizational access?
 
-Respond with a JSON object containing:
-- risk_score: integer from 1-5
-- reasoning: brief explanation of the risk assessment
+2. **Privilege Escalation Potential**
+   - Could this permission be used to gain additional privileges?
+   - Does it enable modifying security settings or user permissions?
 
-JSON Response:"""
+3. **Impact of Misuse**
+   - What damage could occur if maliciously used?
+   - Potential for data breach, service disruption, or financial impact?
+
+4. **Attack Vectors**
+   - How might attackers exploit this permission?
+   - Common misuse patterns in real-world attacks?
+
+**Response Format:**
+Provide a JSON object with the following structure:
+    "risk_score": 5,
+    "reasoning": "Concise explanation covering key risk factors",
+
+Permission Data:
+{json.dumps(permission_data, indent=2)}"""
 
     def analyze_permission(
         self,
