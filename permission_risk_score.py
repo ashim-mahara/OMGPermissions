@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 import litellm
 from litellm import completion
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(
@@ -230,46 +231,75 @@ Permission Data:
         models: List[str] = None,
         api_base_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        num_workers: int = 5,
     ) -> List[Dict]:
         """
-        Process a JSONL file and analyze all permissions.
-
-        Args:
-            file_path: Path to JSONL file
-            models: List of models to use for analysis
+        Process a JSONL file and analyze all permissions using parallel requests.
         """
         if models is None:
-            models = ["gpt-3.5-turbo"]  # Default model
+            models = ["gpt-3.5-turbo"]
 
         results = []
 
         try:
             with open(file_path, "r", encoding="utf-8") as file:
-                for line_num, line in enumerate(file, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
+                lines = [line.strip() for line in file if line.strip()]
 
+            # Process in parallel
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = []
+
+                for line_num, line in enumerate(lines, 1):
+                    future = executor.submit(
+                        self._process_line_with_models,
+                        line,
+                        line_num,
+                        models,
+                        api_base_url,
+                        api_key,
+                    )
+                    futures.append(future)
+
+                # Collect results
+                for future in as_completed(futures):
                     try:
-                        permission_data = json.loads(line)
-
-                        for model in models:
-                            result = self.analyze_permission(
-                                permission_data, model, api_base_url, api_key
-                            )
-                            if result:
-                                results.append(result)
-
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Error parsing line {line_num}: {str(e)}")
-                        continue
+                        line_results = future.result()
+                        results.extend(line_results)
+                    except Exception as e:
+                        logger.error(f"Error in parallel processing: {str(e)}")
 
         except FileNotFoundError:
             logger.error(f"File not found: {file_path}")
-            return
+            return []
 
         logger.info(f"Processed {len(results)} permission analyses")
         return results
+
+    def _process_line_with_models(
+        self,
+        line: str,
+        line_num: int,
+        models: List[str],
+        api_base_url: Optional[str],
+        api_key: Optional[str],
+    ) -> List[Dict]:
+        """Helper method to process a single line with all models."""
+        try:
+            permission_data = json.loads(line)
+            line_results = []
+
+            for model in models:
+                result = self.analyze_permission(
+                    permission_data, model, api_base_url, api_key
+                )
+                if result:
+                    line_results.append(result)
+
+            return line_results
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing line {line_num}: {str(e)}")
+            return []
 
     def get_analysis_results(self, permission_name: str = None) -> List[Dict]:
         """
@@ -317,6 +347,7 @@ def analyze_permissions_file(
     db_path: str = "permission_analysis.db",
     api_base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    num_workers: int = 5,
 ):
     """
     Standalone function to analyze permissions from JSONL file.
@@ -327,7 +358,9 @@ def analyze_permissions_file(
         db_path: Path to SQLite database
     """
     analyzer = PermissionRiskAnalyzer(db_path)
-    return analyzer.process_jsonl_file(file_path, models, api_base_url, api_key)
+    return analyzer.process_jsonl_file(
+        file_path, models, api_base_url, api_key, num_workers
+    )
 
 
 if __name__ == "__main__":
@@ -340,6 +373,13 @@ if __name__ == "__main__":
     parser.add_argument("--file", "-f", required=True, help="Path to JSONL file")
     parser.add_argument("--api_base_url", "-a", default=None, help="LLM API base URL")
     parser.add_argument("--api_key", "-k", default=None, help="LLM API key")
+    parser.add_argument(
+        "--num_workers",
+        "-n",
+        type=int,
+        default=5,
+        help="Number of worker threads for requests",
+    )
     parser.add_argument(
         "--models",
         "-m",
@@ -360,7 +400,12 @@ if __name__ == "__main__":
     print(f"Starting analysis of {args.file} using models: {args.models}")
 
     results = analyze_permissions_file(
-        args.file, args.models, args.db, args.api_base_url, args.api_key
+        args.file,
+        args.models,
+        args.db,
+        args.api_base_url,
+        args.api_key,
+        args.num_workers,
     )
 
     if results:
