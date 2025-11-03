@@ -1,6 +1,7 @@
 import json
+import csv
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import List, Dict, Optional
 from .graph_client import GraphClient
@@ -49,11 +50,27 @@ class ConsentCollector:
         logging.info(f"Total collected sign-ins: {len(all_logs)}")
         return all_logs
 
+    def _write_outputs(self, data: List[Dict], base_name: str):
+        """Write results to JSON and JSONL formats only (no CSV)."""
+        json_path = f"{OUTPUT_DIR}/{base_name}.json"
+        jsonl_path = f"{OUTPUT_DIR}/{base_name}.jsonl"
+
+        # JSON
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        # JSONL
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for item in data:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+        logging.info(f"Saved outputs:\n  JSON → {json_path}\n  JSONL → {jsonl_path}")
+
     def collect_external_consents(
         self,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
-        output_file: str = "external_consents.json",
+        output_file: str = "external_consents",
     ) -> List[ApplicationSummary]:
         """Collect user consented external applications within a time window."""
         users = self.list_users()
@@ -62,14 +79,12 @@ class ConsentCollector:
         for user in users:
             grants = self.get_user_consents(user["id"])
             for g in grants:
-                consent_time = g.get("consentType")
-                # date filter if needed
-                if start and end:
-                    created = g.get("createdDateTime")
-                    if created:
-                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                        if not (start <= dt <= end):
-                            continue
+                if start and end and g.get("createdDateTime"):
+                    dt = datetime.fromisoformat(
+                        g["createdDateTime"].replace("Z", "+00:00")
+                    )
+                    if not (start <= dt <= end):
+                        continue
                 user_consents.append(
                     UserConsent(
                         user_id=user["id"],
@@ -91,7 +106,10 @@ class ConsentCollector:
             app.users.append(uc.user_principal_name)
 
         for app in app_map.values():
-            app.permissions = sorted(set(app.permissions))
+            # clean up permissions and users
+            app.permissions = sorted(
+                {p.strip() for p in app.permissions if isinstance(p, str)}
+            )
             app.users = sorted(set(app.users))
             try:
                 sp_data = self.client.get(
@@ -103,9 +121,6 @@ class ConsentCollector:
                 app.display_name = "External or Unknown"
 
         results = [a.__dict__ for a in app_map.values()]
-        out_path = f"{OUTPUT_DIR}/{output_file}"
-        with open(out_path, "w") as f:
-            json.dump(results, f, indent=2)
-        logging.info(f"Saved {len(results)} apps to {out_path}")
-
+        self._write_outputs(results, output_file)
+        logging.info(f"Processed {len(results)} external consented apps.")
         return list(app_map.values())

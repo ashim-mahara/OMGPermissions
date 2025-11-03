@@ -14,8 +14,8 @@ def parse_args():
     parser.add_argument("--end", help="End date (YYYY-MM-DD)", required=False)
     parser.add_argument(
         "--output",
-        help="Output file name (default: external_consents.json)",
-        default="external_consents.json",
+        help="Base name for output files (no extension)",
+        default="external_consents",
     )
     return parser.parse_args()
 
@@ -35,7 +35,6 @@ def main():
         else None
     )
 
-    # Collect sign-ins iteratively (can be used downstream for analysis)
     if start and end:
         collector.collect_signins(start, end)
 
