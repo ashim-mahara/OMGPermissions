@@ -51,17 +51,20 @@ class ConsentCollector:
         return all_logs
 
     def _write_outputs(self, data: List[Dict], base_name: str):
-        """Write results to JSON and JSONL formats only (no CSV)."""
+        """Write results to JSON + JSONL in outputs directory."""
         json_path = f"{OUTPUT_DIR}/{base_name}.json"
         jsonl_path = f"{OUTPUT_DIR}/{base_name}.jsonl"
 
+        # Convert dataclass objects → dicts (safe for serialization)
+        serialized = [d.__dict__ if hasattr(d, "__dict__") else d for d in data]
+
         # JSON
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump(serialized, f, indent=2, ensure_ascii=False)
 
         # JSONL
         with open(jsonl_path, "w", encoding="utf-8") as f:
-            for item in data:
+            for item in serialized:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
         logging.info(f"Saved outputs:\n  JSON → {json_path}\n  JSONL → {jsonl_path}")
@@ -70,7 +73,6 @@ class ConsentCollector:
         self,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
-        output_file: str = "external_consents",
     ) -> List[ApplicationSummary]:
         """Collect user consented external applications within a time window."""
         users = self.list_users()
@@ -99,6 +101,7 @@ class ConsentCollector:
         app_map: Dict[str, ApplicationSummary] = defaultdict(
             lambda: ApplicationSummary("", "", [], [])
         )
+
         for uc in user_consents:
             app = app_map[uc.app_id]
             app.app_id = uc.app_id
@@ -106,7 +109,6 @@ class ConsentCollector:
             app.users.append(uc.user_principal_name)
 
         for app in app_map.values():
-            # clean up permissions and users
             app.permissions = sorted(
                 {p.strip() for p in app.permissions if isinstance(p, str)}
             )
@@ -120,7 +122,4 @@ class ConsentCollector:
             except Exception:
                 app.display_name = "External or Unknown"
 
-        results = [a.__dict__ for a in app_map.values()]
-        self._write_outputs(results, output_file)
-        logging.info(f"Processed {len(results)} external consented apps.")
         return list(app_map.values())

@@ -38,7 +38,8 @@ def main():
     if start and end:
         collector.collect_signins(start, end)
 
-    collector.collect_external_consents(start, end, args.output)
+    consents = collector.collect_external_consents(start, end)
+    collector._write_outputs(consents, args.output)
 
 
 if __name__ == "__main__":
