@@ -13,9 +13,15 @@ def parse_args():
     parser.add_argument("--start", help="Start date (YYYY-MM-DD)", required=False)
     parser.add_argument("--end", help="End date (YYYY-MM-DD)", required=False)
     parser.add_argument(
+        "--mode",
+        help="Consent collection mode: internal or external",
+        choices=["internal", "external"],
+        default="external",
+    )
+    parser.add_argument(
         "--output",
         help="Base name for output files (no extension)",
-        default="external_consents",
+        default="consents",
     )
     return parser.parse_args()
 
@@ -38,8 +44,12 @@ def main():
     if start and end:
         collector.collect_signins(start, end)
 
-    consents = collector.collect_external_consents(start, end)
-    collector._write_outputs(consents, args.output)
+    if args.mode == "internal":
+        consents = collector.collect_internal_consents(start, end)
+    elif args.mode == "external":
+        consents = collector.collect_external_consents(start, end)
+
+    collector._write_outputs(consents, args.output, args.mode)
 
 
 if __name__ == "__main__":
