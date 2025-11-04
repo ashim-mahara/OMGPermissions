@@ -3,7 +3,7 @@ import csv
 import logging
 from datetime import datetime, timedelta
 from collections import defaultdict
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from .graph_client import GraphClient
 from .config import GRAPH_BASE, OUTPUT_DIR
 from .models import UserConsent, ApplicationSummary
@@ -50,10 +50,10 @@ class ConsentCollector:
         logging.info(f"Total collected sign-ins: {len(all_logs)}")
         return all_logs
 
-    def _write_outputs(self, data: List[Dict], base_name: str):
+    def _write_outputs(self, data: List[Dict], base_name: str, mode: str):
         """Write results to JSON + JSONL in outputs directory."""
-        json_path = f"{OUTPUT_DIR}/{base_name}.json"
-        jsonl_path = f"{OUTPUT_DIR}/{base_name}.jsonl"
+        json_path = f"{OUTPUT_DIR}/{base_name}-{mode}.json"
+        jsonl_path = f"{OUTPUT_DIR}/{base_name}-{mode}.jsonl"
 
         # Convert dataclass objects → dicts (safe for serialization)
         serialized = [d.__dict__ if hasattr(d, "__dict__") else d for d in data]
@@ -68,6 +68,91 @@ class ConsentCollector:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
         logging.info(f"Saved outputs:\n  JSON → {json_path}\n  JSONL → {jsonl_path}")
+
+    def collect_internal_consents(
+        self, start: Optional[datetime] = None, end: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Collect details about internal applications registered within the tenant.
+        Includes metadata about app creation, permissions, and consent.
+        """
+        # Get all applications
+        url = f"{GRAPH_BASE}/applications?$select=id,appId,displayName,createdDateTime,signInAudience,publisherDomain,createdBy"
+        apps = self.client.paged_get(url)
+        internal_apps = [a for a in apps if a.get("signInAudience") == "AzureADMyOrg"]
+
+        results = []
+        for app in internal_apps:
+            app_id = app.get("appId")
+            if not app_id:
+                logging.warning("Skipping app with missing appId")
+                continue
+
+            app_data = {
+                "appId": app_id,
+                "displayName": app.get("displayName"),
+                "createdDateTime": app.get("createdDateTime"),
+                "signInAudience": app.get("signInAudience"),
+                "publisherDomain": app.get("publisherDomain"),
+                "createdBy": app.get("createdBy", {})
+                .get("user", {})
+                .get("displayName"),
+                "createdByUserId": app.get("createdBy", {}).get("user", {}).get("id"),
+            }
+
+            # Filter by creation date if range specified
+            if start and end and app_data["createdDateTime"]:
+                created = datetime.fromisoformat(
+                    app_data["createdDateTime"].replace("Z", "+00:00")
+                )
+                if not (start <= created <= end):
+                    continue
+
+            # Get service principal (enterprise app object)
+            try:
+                sp_resp = self.client.get(
+                    f"{GRAPH_BASE}/servicePrincipals?$filter=appId eq '{app_id}'"
+                )
+                if sp_resp.get("value"):
+                    sp = sp_resp["value"][0]
+                    app_data["servicePrincipalId"] = sp.get("id")
+            except Exception as e:
+                logging.warning(
+                    f"Failed to get service principal for appId {app_id}: {e}"
+                )
+                app_data["servicePrincipalId"] = None
+
+            # Get assigned permissions / roles
+            try:
+                grants = self.client.paged_get(
+                    f"{GRAPH_BASE}/oauth2PermissionGrants?$filter=clientId eq '{app_id}'"
+                )
+                app_data["oauth2PermissionGrants"] = [g.get("scope") for g in grants]
+            except Exception as e:
+                logging.warning(
+                    f"Failed to get OAuth2 permission grants for appId {app_id}: {e}"
+                )
+                app_data["oauth2PermissionGrants"] = []
+
+            try:
+                if not app_data["servicePrincipalId"]:
+                    continue
+
+                roles = self.client.paged_get(
+                    f"{GRAPH_BASE}/servicePrincipals/{app_data['servicePrincipalId']}/appRoleAssignedTo"
+                )
+                app_data["appRoleAssignments"] = [
+                    r.get("principalDisplayName") for r in roles
+                ]
+            except Exception as e:
+                logging.warning(
+                    f"Failed to get app role assignments for servicePrincipalId {app_data['servicePrincipalId']}: {e}"
+                )
+                app_data["appRoleAssignments"] = []
+
+            results.append(app_data)
+
+        return results
 
     def collect_external_consents(
         self,
