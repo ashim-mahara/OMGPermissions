@@ -3,9 +3,10 @@ import sqlite3
 import json
 import logging
 from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
+
 from .consent_collector import ConsentCollector
-from .alert_notification import SlackNotifier
+from .alert_notification import SlackNotifier  # expects a simple webhook-based notifier
 
 LEVEL_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
@@ -16,21 +17,33 @@ class DetectionPipeline:
         consent_collector: ConsentCollector,
         permission_db: str = "permission_analysis.db",
         state_db: str = "detection_state.db",
-        slack_webhook_url: str | None = None,
-        alert_threshold_level: str = "high",  # alert at/above this tier
-        top_perm_count: int = 3,  # number of perms to show in alert
+        slack_webhook_url: Optional[str] = None,
+        alert_threshold_level: str = "medium",
+        top_perm_count: int = 3,
+        spike_score: int = 5,
+        spike_multi_count: int = 2,
+        spike_bypass_threshold: bool = True,
+        alert_once_per_app: bool = True,
     ):
         self.collector = consent_collector
         self.permission_db = permission_db
         self.state_db = state_db
         self.top_perm_count = top_perm_count
-        self._init_state_db()
+
         self.slack = SlackNotifier(slack_webhook_url)
         if alert_threshold_level not in LEVEL_ORDER:
-            raise ValueError("Invalid alert threshold")
+            raise ValueError("Invalid alert_threshold_level")
         self.alert_threshold_level = alert_threshold_level
 
-    # Setup database tables
+        self.spike_score = spike_score
+        self.spike_multi_count = spike_multi_count
+        self.spike_bypass_threshold = spike_bypass_threshold
+        self.alert_once_per_app = alert_once_per_app
+
+        self._init_state_db()
+        self._risk_cache = self._load_risk_cache()
+
+    # ------------------- DB bootstrap -------------------
     def _init_state_db(self):
         conn = sqlite3.connect(self.state_db)
         cur = conn.cursor()
@@ -40,10 +53,10 @@ class DetectionPipeline:
                 app_id TEXT UNIQUE,
                 display_name TEXT,
                 publisher_domain TEXT,
-                type TEXT, -- internal | external
+                type TEXT,
                 total_risk REAL,
                 risk_level TEXT,
-                permissions TEXT, -- JSON array
+                permissions TEXT,
                 last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -59,33 +72,41 @@ class DetectionPipeline:
         conn.commit()
         conn.close()
 
-    # Lookup risk scores for permissions
+    # ------------------- Risk cache -------------------
+    def _load_risk_cache(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Load all rows from permission_analysis into an in-memory cache.
+        No aggregation, no deduplication — direct mapping of last-seen rows.
+        """
+        sql = "SELECT permission_name, risk_score, COALESCE(reasoning,'') FROM permission_analysis"
+        conn = sqlite3.connect(self.permission_db)
+        cur = conn.cursor()
+        cur.execute(sql)
+        cache = {}
+        for name, score, reason in cur.fetchall():
+            if name:
+                cache[name.strip().lower()] = {
+                    "score": int(score),
+                    "reason": reason or "",
+                }
+        conn.close()
+        return cache
+
+    # ------------------- Risk lookups (cache-only) -------------------
     def _get_permission_risk_rows(
         self, permission_names: List[str]
     ) -> List[Tuple[str, int, str]]:
-        if not permission_names:
-            return []
-        q_marks = ",".join(["?"] * len(permission_names))
-        sql = f"SELECT permission_name, risk_score, COALESCE(reasoning,'') FROM permission_analysis WHERE permission_name IN ({q_marks})"
-        conn = sqlite3.connect(self.permission_db)
-        cur = conn.cursor()
-        cur.execute(sql, permission_names)
-        rows = cur.fetchall()
-        conn.close()
-        return rows  # (name, score, reasoning)
+        rows = []
+        for p in permission_names or []:
+            v = self._risk_cache.get(p.strip().lower())
+            if v:
+                rows.append((p, v["score"], v["reason"]))
+        return rows
 
     def _get_permission_risk(self, permission_name: str) -> Optional[int]:
-        conn = sqlite3.connect(self.permission_db)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT risk_score FROM permission_analysis WHERE permission_name = ?",
-            (permission_name,),
-        )
-        row = cur.fetchone()
-        conn.close()
-        return row[0] if row else None
+        v = self._risk_cache.get(permission_name.strip().lower())
+        return v["score"] if v else None
 
-    # ------------------- Risk Calculation -------------------
     def _calculate_app_risk(self, permissions: List[str]) -> Tuple[float, str]:
         scores = [self._get_permission_risk(p) for p in permissions]
         scores = [s for s in scores if s is not None]
@@ -102,7 +123,7 @@ class DetectionPipeline:
             level = "low"
         return avg, level
 
-    # DB utilities
+    # ------------------- State helpers -------------------
     def _get_existing_app(self, app_id: str) -> Optional[dict]:
         conn = sqlite3.connect(self.state_db)
         cur = conn.cursor()
@@ -117,7 +138,6 @@ class DetectionPipeline:
         conn.close()
         if not row:
             return None
-        perms = []
         try:
             perms = json.loads(row[6]) if row[6] else []
         except Exception:
@@ -172,7 +192,7 @@ class DetectionPipeline:
         conn.commit()
         conn.close()
 
-    # alerting utilities
+    # ------------------- Alert helpers -------------------
     def _level_meets_threshold(self, level: str) -> bool:
         return LEVEL_ORDER.get(level, 0) >= LEVEL_ORDER[self.alert_threshold_level]
 
@@ -180,14 +200,13 @@ class DetectionPipeline:
         self, permissions: List[str], k: int
     ) -> List[Tuple[str, int, str]]:
         rows = self._get_permission_risk_rows(permissions)
-        rows.sort(key=lambda t: (t[1] if t[1] is not None else -1), reverse=True)
-        # ensure only known perms with scores are shown
-        filtered = [(n, s, r) for (n, s, r) in rows if s is not None]
-        return filtered[:k]
+        rows.sort(key=lambda t: t[1], reverse=True)
+        return rows[:k]
 
     def _send_slack_alert(
         self,
-        event: str,  # "new", "tier_increase", "perm_added"
+        *,
+        event: str,
         app_id: str,
         app_name: str,
         app_type: str,
@@ -202,8 +221,8 @@ class DetectionPipeline:
 
         top = self._top_risky_permissions(permissions, self.top_perm_count)
         top_lines = [
-            f"• *{name}* (risk {score})" + (f" — {reason}" if reason else "")
-            for name, score, reason in top
+            f"• *{n}* (risk {s}) — {r}" if r else f"• *{n}* (risk {s})"
+            for (n, s, r) in top
         ] or ["• No scored permissions found"]
 
         title_emoji = (
@@ -228,39 +247,111 @@ class DetectionPipeline:
                     },
                 ],
             },
-        ]
-        if delta_info:
-            blocks.append(
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*Change:* {delta_info}"},
-                }
-            )
-        blocks.append(
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
                     "text": "*Top risky permissions:*\n" + "\n".join(top_lines),
                 },
-            }
-        )
-        blocks.append(
+            },
             {
                 "type": "context",
                 "elements": [
                     {"type": "mrkdwn", "text": "_Automated detection pipeline_"}
                 ],
-            }
-        )
+            },
+        ]
+
+        if delta_info:
+            blocks.insert(
+                2,
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*Change:* {delta_info}"},
+                },
+            )
 
         plain = f"{title}\nApp: {app_name} ({app_id})\nRisk: {risk_level} ({total_risk:.2f})\n{delta_info}"
         self.slack.send(text=plain, blocks=blocks)
 
-    # main detection run
+    # ------------------- Spike logic -------------------
+    def _risk_stats(self, permissions: List[str]) -> Dict[str, Any]:
+        rows = self._get_permission_risk_rows(permissions)
+        scores = {n: s for (n, s, _) in rows}
+        max_score = max(scores.values()) if scores else 0
+        count_spike = sum(1 for s in scores.values() if s == self.spike_score)
+        return {
+            "scores": scores,
+            "max": max_score,
+            "count_spike": count_spike,
+            "has_spike": count_spike >= 1,
+            "multi_spike": count_spike >= self.spike_multi_count,
+            "spike_perms": sorted(
+                [n for n, s in scores.items() if s == self.spike_score]
+            ),
+        }
+
+    def _maybe_send_spike_alerts(
+        self,
+        *,
+        app_id: str,
+        app_name: str,
+        app_type: str,
+        publisher_domain: str,
+        current_perms: List[str],
+        previous_perms: Optional[List[str]],
+        risk_level: str,
+        total_risk: float,
+    ) -> bool:
+        cur = self._risk_stats(current_perms)
+        prev = self._risk_stats(previous_perms or [])
+
+        def _gate():
+            return (
+                True
+                if self.spike_bypass_threshold
+                else self._level_meets_threshold(risk_level)
+            )
+
+        if cur["multi_spike"] and (
+            prev["count_spike"] < self.spike_multi_count
+            or cur["count_spike"] > prev["count_spike"]
+        ):
+            if _gate():
+                self._send_slack_alert(
+                    event="spike_multiple",
+                    app_id=app_id,
+                    app_name=app_name,
+                    app_type=app_type,
+                    publisher_domain=publisher_domain,
+                    risk_level=risk_level,
+                    total_risk=total_risk,
+                    permissions=current_perms,
+                    delta_info=f"Spike permissions increased: {prev['count_spike']} → {cur['count_spike']}. "
+                    f"Spike value={self.spike_score}; perms: {', '.join(cur['spike_perms']) or '—'}",
+                )
+                return True
+
+        if cur["has_spike"] and not prev["has_spike"]:
+            if _gate():
+                self._send_slack_alert(
+                    event="spike_present",
+                    app_id=app_id,
+                    app_name=app_name,
+                    app_type=app_type,
+                    publisher_domain=publisher_domain,
+                    risk_level=risk_level,
+                    total_risk=total_risk,
+                    permissions=current_perms,
+                    delta_info=f"Detected ≥1 permission with risk score {self.spike_score}. "
+                    f"Perms: {', '.join(cur['spike_perms']) or '—'}",
+                )
+                return True
+        return False
+
+    # ------------------- Main run -------------------
     def run_detection(self):
         logging.info("Collecting internal and external consents...")
-
         internal = self.collector.collect_internal_consents()
         external = self.collector.collect_external_consents()
 
@@ -268,9 +359,84 @@ class DetectionPipeline:
         new_apps = 0
         changed_apps = 0
 
-        # internal application
+        def process_app(app_id, display_name, app_type, publisher_domain, permissions):
+            nonlocal new_apps, changed_apps
+            total_risk, risk_level = self._calculate_app_risk(permissions)
+            existing = self._get_existing_app(app_id)
+            is_new = existing is None
+            prev_perms = existing.get("permissions", []) if existing else []
+
+            sent = self._maybe_send_spike_alerts(
+                app_id=app_id,
+                app_name=display_name,
+                app_type=app_type,
+                publisher_domain=publisher_domain,
+                current_perms=permissions,
+                previous_perms=prev_perms,
+                risk_level=risk_level,
+                total_risk=total_risk,
+            )
+
+            if not (self.alert_once_per_app and sent):
+                if is_new and self._level_meets_threshold(risk_level):
+                    new_apps += 1
+                    self._send_slack_alert(
+                        event="new",
+                        app_id=app_id,
+                        app_name=display_name,
+                        app_type=app_type,
+                        publisher_domain=publisher_domain,
+                        risk_level=risk_level,
+                        total_risk=total_risk,
+                        permissions=permissions,
+                        delta_info="New application observed.",
+                    )
+                elif not is_new:
+                    prev_level = existing.get("risk_level", "low")
+                    if LEVEL_ORDER.get(risk_level, 0) > LEVEL_ORDER.get(
+                        prev_level, 0
+                    ) and self._level_meets_threshold(risk_level):
+                        changed_apps += 1
+                        self._send_slack_alert(
+                            event="tier_increase",
+                            app_id=app_id,
+                            app_name=display_name,
+                            app_type=app_type,
+                            publisher_domain=publisher_domain,
+                            risk_level=risk_level,
+                            total_risk=total_risk,
+                            permissions=permissions,
+                            delta_info=f"Risk tier increased: {prev_level} → {risk_level}",
+                        )
+                    else:
+                        gained = sorted(set(permissions) - set(prev_perms))
+                        if gained and self._level_meets_threshold(risk_level):
+                            changed_apps += 1
+                            self._send_slack_alert(
+                                event="perm_added",
+                                app_id=app_id,
+                                app_name=display_name,
+                                app_type=app_type,
+                                publisher_domain=publisher_domain,
+                                risk_level=risk_level,
+                                total_risk=total_risk,
+                                permissions=permissions,
+                                delta_info=f"New permissions granted: {', '.join(gained)}",
+                            )
+
+            self._upsert_app(
+                app_id,
+                display_name,
+                publisher_domain,
+                app_type,
+                total_risk,
+                risk_level,
+                permissions,
+            )
+
         for app in internal:
-            current_perms = sorted(
+            app_id = app["appId"]
+            perms = sorted(
                 {
                     ra["value"]
                     for res in app.get("requiredResourceAccess", [])
@@ -278,141 +444,23 @@ class DetectionPipeline:
                     if ra.get("value")
                 }
             )
-            total_risk, risk_level = self._calculate_app_risk(current_perms)
-
-            app_id = app["appId"]
-            existing = self._get_existing_app(app_id)
-            is_new = existing is None
-            gained_perms: list[str] = []
-
-            if not is_new:
-                prev_perms = set(existing.get("permissions", []))
-                gained_perms = sorted(set(current_perms) - prev_perms)
-
-            # Alert decisions
-            if is_new and self._level_meets_threshold(risk_level):
-                new_apps += 1
-                self._send_slack_alert(
-                    event="new",
-                    app_id=app_id,
-                    app_name=app.get("displayName", ""),
-                    app_type="internal",
-                    publisher_domain=app.get("publisherDomain", ""),
-                    risk_level=risk_level,
-                    total_risk=total_risk,
-                    permissions=current_perms,
-                    delta_info="New application observed.",
-                )
-            elif not is_new:
-                prev_level = existing.get("risk_level", "low")
-                if LEVEL_ORDER.get(risk_level, 0) > LEVEL_ORDER.get(
-                    prev_level, 0
-                ) and self._level_meets_threshold(risk_level):
-                    changed_apps += 1
-                    self._send_slack_alert(
-                        event="tier_increase",
-                        app_id=app_id,
-                        app_name=app.get("displayName", ""),
-                        app_type="internal",
-                        publisher_domain=app.get("publisherDomain", ""),
-                        risk_level=risk_level,
-                        total_risk=total_risk,
-                        permissions=current_perms,
-                        delta_info=f"Risk tier increased: {prev_level} → {risk_level}",
-                    )
-                elif gained_perms and self._level_meets_threshold(risk_level):
-                    changed_apps += 1
-                    self._send_slack_alert(
-                        event="perm_added",
-                        app_id=app_id,
-                        app_name=app.get("displayName", ""),
-                        app_type="internal",
-                        publisher_domain=app.get("publisherDomain", ""),
-                        risk_level=risk_level,
-                        total_risk=total_risk,
-                        permissions=current_perms,
-                        delta_info=f"New permissions granted: {', '.join(gained_perms)}",
-                    )
-
-            # persist
-            self._upsert_app(
-                app_id=app_id,
-                display_name=app.get("displayName", ""),
-                publisher_domain=app.get("publisherDomain", ""),
-                app_type="internal",
-                total_risk=total_risk,
-                risk_level=risk_level,
-                permissions=current_perms,
+            process_app(
+                app_id,
+                app.get("displayName", ""),
+                "internal",
+                app.get("publisherDomain", ""),
+                perms,
             )
 
-        # External applications
         for app in external:
-            current_perms = sorted(set(app.permissions))
-            total_risk, risk_level = self._calculate_app_risk(current_perms)
-
-            app_id = app.app_id
-            existing = self._get_existing_app(app_id)
-            is_new = existing is None
-            gained_perms: list[str] = []
-            if not is_new:
-                prev_perms = set(existing.get("permissions", []))
-                gained_perms = sorted(set(current_perms) - prev_perms)
-
-            if is_new and self._level_meets_threshold(risk_level):
-                new_apps += 1
-                self._send_slack_alert(
-                    event="new",
-                    app_id=app_id,
-                    app_name=app.display_name or "",
-                    app_type="external",
-                    publisher_domain="",
-                    risk_level=risk_level,
-                    total_risk=total_risk,
-                    permissions=current_perms,
-                    delta_info="New external application observed.",
-                )
-            elif not is_new:
-                prev_level = existing.get("risk_level", "low")
-                if LEVEL_ORDER.get(risk_level, 0) > LEVEL_ORDER.get(
-                    prev_level, 0
-                ) and self._level_meets_threshold(risk_level):
-                    changed_apps += 1
-                    self._send_slack_alert(
-                        event="tier_increase",
-                        app_id=app_id,
-                        app_name=app.display_name or "",
-                        app_type="external",
-                        publisher_domain="",
-                        risk_level=risk_level,
-                        total_risk=total_risk,
-                        permissions=current_perms,
-                        delta_info=f"Risk tier increased: {prev_level} → {risk_level}",
-                    )
-                elif gained_perms and self._level_meets_threshold(risk_level):
-                    changed_apps += 1
-                    self._send_slack_alert(
-                        event="perm_added",
-                        app_id=app_id,
-                        app_name=app.display_name or "",
-                        app_type="external",
-                        publisher_domain="",
-                        risk_level=risk_level,
-                        total_risk=total_risk,
-                        permissions=current_perms,
-                        delta_info=f"New permissions granted: {', '.join(gained_perms)}",
-                    )
-
-            self._upsert_app(
-                app_id=app_id,
-                display_name=app.display_name or "",
-                publisher_domain="",
-                app_type="external",
-                total_risk=total_risk,
-                risk_level=risk_level,
-                permissions=current_perms,
+            process_app(
+                app.app_id,
+                app.display_name or "",
+                "external",
+                "",
+                sorted(set(app.permissions)),
             )
 
-        # run metadata
         conn = sqlite3.connect(self.state_db)
         cur = conn.cursor()
         cur.execute(
@@ -421,7 +469,6 @@ class DetectionPipeline:
         )
         conn.commit()
         conn.close()
-
         logging.info(
             f"Detection completed. total={total} new={new_apps} changed={changed_apps}"
         )
