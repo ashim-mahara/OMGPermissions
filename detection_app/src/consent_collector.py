@@ -1,12 +1,11 @@
 import json
-import csv
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
 from typing import List, Dict, Optional, Any
 from .graph_client import GraphClient
 from .config import GRAPH_BASE, OUTPUT_DIR
-from .models import UserConsent, ApplicationSummary
+from .models import ApplicationSummary
 from .external_app_resolver import ExternalAppResolver
 
 
@@ -31,33 +30,6 @@ class ConsentCollector:
     def get_user_consents(self, user_id: str) -> List[Dict]:
         url = f"{GRAPH_BASE}/users/{user_id}/oauth2PermissionGrants"
         return self.client.paged_get(url)
-
-    def collect_signins(
-        self,
-        start: datetime,
-        end: datetime,
-        step_days: int = 2,
-    ) -> List[Dict]:
-        """Iteratively collect sign-ins between date ranges to avoid 504 errors."""
-        all_logs = []
-        current = start
-        while current < end:
-            next_cursor = min(current + timedelta(days=step_days), end)
-            filter_query = f"createdDateTime ge {current.isoformat()} and createdDateTime lt {next_cursor.isoformat()}"
-            url = f"{GRAPH_BASE}/auditLogs/signIns"
-            params = {"$filter": filter_query, "$top": 100}
-            logging.info(f"Fetching sign-ins {current} → {next_cursor}")
-            try:
-                logs = self.client.paged_get(url, params=params)
-                all_logs.extend(logs)
-                logging.info(f"  +{len(logs)} logs fetched in window.")
-            except Exception as e:
-                logging.warning(
-                    f"Failed fetching logs for {current}–{next_cursor}: {e}"
-                )
-            current = next_cursor
-        logging.info(f"Total collected sign-ins: {len(all_logs)}")
-        return all_logs
 
     def _write_outputs(self, data: List[Dict], base_name: str, mode: str):
         """Write results to JSON + JSONL in outputs directory."""
@@ -122,23 +94,6 @@ class ConsentCollector:
                 )
                 perm_schema_cache[resource_app_id] = {"scopes": {}, "roles": {}}
                 return perm_schema_cache[resource_app_id]
-
-        def resolve_resource(resource_id: str):
-            """Resolve a servicePrincipal objectId → displayName + appId."""
-            if resource_id in resource_cache:
-                return resource_cache[resource_id]
-            try:
-                res = self.client.get(
-                    f"{GRAPH_BASE}/servicePrincipals/{resource_id}?$select=displayName,appId"
-                )
-                resource_cache[resource_id] = {
-                    "displayName": res.get("displayName"),
-                    "appId": res.get("appId"),
-                }
-                return resource_cache[resource_id]
-            except Exception:
-                resource_cache[resource_id] = {"displayName": "Unknown", "appId": None}
-                return resource_cache[resource_id]
 
         def resolve_resource_sp_by_appid(resource_app_id: str) -> Optional[str]:
             """Translate a global appId (like Microsoft Graph) to the tenant-specific SP objectId."""
