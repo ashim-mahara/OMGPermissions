@@ -1,7 +1,9 @@
 import argparse
 import logging
-from datetime import datetime, timezone
+import os
+from pathlib import Path
 from src.consent_collector import ConsentCollector
+from src.detection_pipeline import DetectionPipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -10,13 +12,19 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Collect external consented apps and sign-ins."
     )
-    parser.add_argument("--start", help="Start date (YYYY-MM-DD)", required=False)
-    parser.add_argument("--end", help="End date (YYYY-MM-DD)", required=False)
     parser.add_argument(
-        "--mode",
-        help="Consent collection mode: internal or external",
-        choices=["internal", "external"],
-        default="external",
+        "--permission-db",
+        dest="permission_db_path",
+        type=Path,
+        default=Path(os.getenv("PERMISSION_DB", "permission_analysis.db")),
+        help="Path to permission_analysis.db (env: PERMISSION_DB).",
+    )
+    parser.add_argument(
+        "--state-db",
+        dest="state_db_path",
+        type=Path,
+        default=Path(os.getenv("DETECTION_STATE_DB", "detection_state.db")),
+        help="Path to detection_state.db (env: DETECTION_STATE_DB).",
     )
     parser.add_argument(
         "--output",
@@ -30,26 +38,13 @@ def main():
     args = parse_args()
     collector = ConsentCollector()
 
-    start = (
-        datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
-        if args.start
-        else None
+    collector = ConsentCollector()
+    pipeline = DetectionPipeline(
+        collector,
+        permission_db_path=args.permission_db_path,
+        state_db_path=args.state_db_path,
     )
-    end = (
-        datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
-        if args.end
-        else None
-    )
-
-    if start and end:
-        collector.collect_signins(start, end)
-
-    if args.mode == "internal":
-        consents = collector.collect_internal_consents(start, end)
-    elif args.mode == "external":
-        consents = collector.collect_external_consents(start, end)
-
-    collector._write_outputs(consents, args.output, args.mode)
+    pipeline.run_detection()
 
 
 if __name__ == "__main__":

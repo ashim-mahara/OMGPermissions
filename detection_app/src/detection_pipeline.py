@@ -51,8 +51,8 @@ class DetectionPipeline:
     def __init__(
         self,
         consent_collector: ConsentCollector,
-        permission_db: str = "permission_analysis.db",
-        state_db: str = "detection_state.db",
+        permission_db_path: str = "permission_analysis.db",
+        state_db_path: str = "detection_state.db",
         slack_webhook_url: Optional[str] = None,
         alert_threshold_level: str = "medium",  # fire standard alerts at/above this tier
         top_perm_count: int = 3,  # how many perms to list in alerts
@@ -66,8 +66,8 @@ class DetectionPipeline:
         gm_order: float = 3.0,  # generalized-mean order (3.0=Cubic). Supports 0 (geo), +/-inf, negatives.
     ):
         self.collector = consent_collector
-        self.permission_db = permission_db
-        self.state_db = state_db
+        self.permission_db = permission_db_path
+        self.state_db = state_db_path
         self.top_perm_count = top_perm_count
 
         # Alerts
