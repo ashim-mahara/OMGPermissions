@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+	<title>Authentication Error</title>
+	<script>
+		window.onload = function () {
+			try {
+				window.close();
+			} catch (e) {
+				// If window can't be closed, just leave the error message visible
+				console.log("error closing window:", e);
+				console.log("Window could not be closed automatically. Please close it manually.");
+			}
+		};
+	</script>
+</head>
+
+<body>
+	<h1>Authentication Error</h1>
+	<p>{{ error }}</p>
+	<br>
+	<a href="/"><button>Return to Home</button></a>
+</body>
+
+</html>
+
+<!-- <!DOCTYPE html>
+<html>
+
+<head>
+	<title>Authentication Error</title>
+	<script>
+		// Set the wait time (0 for immediate close, or number of seconds to wait)
+		const wait = 0; // Change this value as needed
+
+		function closeWindow() {
+			try {
+				window.close();
+			} catch (e) {
+				document.getElementById('close-status').textContent =
+					"Window could not be closed automatically. Please close it manually.";
+			}
+		}
+
+		window.onload = function () {
+			if (wait === 0) {
+				// Close immediately
+				closeWindow();
+			} else if (wait > 0) {
+				// Show countdown and close after wait seconds
+				document.getElementById('countdown').style.display = 'block';
+				let seconds = wait;
+				document.getElementById('seconds').textContent = seconds;
+
+				const countdownInterval = setInterval(() => {
+					seconds--;
+					document.getElementById('seconds').textContent = seconds;
+
+					if (seconds <= 0) {
+						clearInterval(countdownInterval);
+						closeWindow();
+					}
+				}, 1000);
+			}
+			// If wait is negative or not a number, do nothing
+		};
+	</script>
+	<style>
+		body {
+			font-family: Arial, sans-serif;
+			max-width: 500px;
+			margin: 50px auto;
+			padding: 20px;
+			text-align: center;
+		}
+
+		#countdown {
+			display: none;
+			margin: 15px 0;
+			font-weight: bold;
+			color: #d93025;
+		}
+
+		#close-status {
+			margin: 15px 0;
+			color: #666;
+		}
+
+		button {
+			padding: 8px 16px;
+			margin-top: 10px;
+		}
+	</style>
+</head>
+
+<body>
+	<h1>Authentication Error</h1>
+	<p>{{ error }}</p>
+
+	<div id="countdown">
+		Closing in <span id="seconds">0</span> seconds...
+	</div>
+
+	<div id="close-status"></div>
+
+	<br>
+	<a href="/"><button>Return to Home</button></a>
+</body>
+
+</html> -->
