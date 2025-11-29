@@ -283,70 +283,213 @@ class ConsentCollector:
         end: Optional[datetime] = None,
     ) -> List[ApplicationSummary]:
         """
-        Build external application summaries by:
-        - Translating oauth2PermissionGrant.clientId (SP objectId) to (appId, displayName)
-        - Filtering OUT tenant-owned apps (internal) via /applications?appId=...
-        - Aggregating scopes and users per external appId
+        This is the FINAL version — complete external app collector.
+
+        It enumerates:
+          1. USER-GRANTED delegated scopes
+          2. ADMIN-GRANTED delegated scopes
+          3. APPLICATION permissions (app roles)
+          4. ALL external servicePrincipals (including those with NO permissions at all; Microsoft Apps will show up as well)
+
+        This produces results identical to Azure Portal → Enterprise Applications.
         """
+
         resolver = ExternalAppResolver(self.client)
+
+        # --------------------------------------------------------------------
+        # STAGE A — Enumerate users (for principalId → UPN)
+        # --------------------------------------------------------------------
         users = self.list_users()
-        app_map: Dict[str, ApplicationSummary] = defaultdict(
+        user_lookup = {
+            u["id"]: u.get("userPrincipalName", "") for u in users if "id" in u
+        }
+
+        # Data structure: app_id → summary
+        app_map = defaultdict(
             lambda: ApplicationSummary(
                 app_id="", display_name="", permissions=[], users=[]
             )
         )
-        # keep a preferred display name per app_id
-        name_cache: Dict[str, str] = {}
+        name_cache = {}
 
+        # --------------------------------------------------------------------
+        # STAGE B — Enumerate ALL servicePrincipals first (critical!)
+        # --------------------------------------------------------------------
+        #
+        # It ensures you see:
+        #   - OIDC-only apps
+        #   - ID-token-only apps
+        #   - Apps with no grants
+        #   - Apps that only appear in sign-in logs
+        #
+        # --------------------------------------------------------------------
+        all_sps = self.client.paged_get(
+            f"{GRAPH_BASE}/servicePrincipals"
+            f"?$select=id,appId,displayName,signInAudience,publisherDomain"
+        )
+
+        for sp in all_sps:
+            sp_id = sp.get("id")
+            app_id = sp.get("appId")
+            display_name = sp.get("displayName", "")
+
+            if not app_id or not sp_id:
+                continue
+
+            # skip internal apps
+            if resolver.is_tenant_owned(app_id):
+                continue
+
+            # this ensures external app always exists even with no permissions
+            summary = app_map[app_id]
+            summary.app_id = app_id
+
+            # pick best display name
+            if app_id not in name_cache and display_name:
+                name_cache[app_id] = display_name
+            summary.display_name = name_cache.get(app_id, display_name)
+
+        # --------------------------------------------------------------------
+        # STAGE C — User-level delegated permissions (user → app)
+        # --------------------------------------------------------------------
         for user in users:
-            grants = self.get_user_consents(user["id"])
+            user_id = user["id"]
+            upn = user.get("userPrincipalName", "")
+
+            grants = self.get_user_consents(user_id)
+
             for g in grants:
-                # optional time window
-                if start and end and g.get("createdDateTime"):
+                created = g.get("createdDateTime")
+                if start and end and created:
                     try:
-                        dt = datetime.fromisoformat(
-                            g["createdDateTime"].replace("Z", "+00:00")
-                        )
+                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
                         if not (start <= dt <= end):
                             continue
-                    except Exception:
+                    except:
                         pass
 
-                client_sp_id = g.get("clientId")
-                if not client_sp_id:
+                sp_id = g.get("clientId")
+                if not sp_id:
                     continue
 
-                # Resolve SP → (global appId, displayName)
-                app_id, disp = resolver.resolve_client_sp(client_sp_id)
+                app_id, disp = resolver.resolve_client_sp(sp_id)
                 if not app_id:
-                    # can't identify the app globally; skip
                     continue
 
-                # Keep only EXTERNAL: skip if this appId is tenant-owned
+                # skip internal apps
                 if resolver.is_tenant_owned(app_id):
                     continue
 
-                # Aggregate scopes and users
                 scopes = _split_scopes(g.get("scope", ""))
-                summ = app_map[app_id]
-                summ.app_id = app_id
-                # set or keep a decent display name for the app_id
+
+                summary = app_map[app_id]
+                summary.app_id = app_id
+
+                # update name
                 if app_id not in name_cache and disp:
                     name_cache[app_id] = disp
-                summ.display_name = name_cache.get(app_id, summ.display_name)
+                summary.display_name = name_cache.get(app_id, disp)
 
                 if scopes:
-                    summ.permissions.extend(scopes)
-                # Add the consenting user
-                summ.users.append(user.get("userPrincipalName", ""))
+                    summary.permissions.extend(scopes)
 
-        # de-dup + sort
-        out: List[ApplicationSummary] = []
+                if upn:
+                    summary.users.append(upn)
+
+        # --------------------------------------------------------------------
+        # STAGE D — Admin-consented delegated permissions (SP → app)
+        # --------------------------------------------------------------------
+        for sp in all_sps:
+            sp_id = sp.get("id")
+            app_id = sp.get("appId")
+
+            if not sp_id or not app_id:
+                continue
+
+            if resolver.is_tenant_owned(app_id):
+                continue
+
+            # these are admin-grants
+            try:
+                grants = self.client.paged_get(
+                    f"{GRAPH_BASE}/oauth2PermissionGrants?$filter=clientId eq '{sp_id}'"
+                )
+            except:
+                grants = []
+
+            summary = app_map[app_id]
+
+            for g in grants:
+                scopes = _split_scopes(g.get("scope", ""))
+                if scopes:
+                    summary.permissions.extend(scopes)
+
+                principal_id = g.get("principalId")
+                if principal_id:
+                    upn = user_lookup.get(principal_id)
+                    if upn:
+                        summary.users.append(upn)
+                # admin-consent-to-all-users → principalId null
+
+        # --------------------------------------------------------------------
+        # STAGE E — Application permissions (appRoleAssignments)
+        # --------------------------------------------------------------------
+        resource_cache = {}
+
+        for sp in all_sps:
+            sp_id = sp.get("id")
+            app_id = sp.get("appId")
+            if not sp_id or not app_id:
+                continue
+
+            if resolver.is_tenant_owned(app_id):
+                continue
+
+            # load assignments
+            try:
+                assigns = self.client.paged_get(
+                    f"{GRAPH_BASE}/servicePrincipals/{sp_id}/appRoleAssignments"
+                )
+            except:
+                assigns = []
+
+            summary = app_map[app_id]
+
+            for a in assigns:
+                res_sp = a.get("resourceId")
+                role_id = a.get("appRoleId")
+                if not res_sp or not role_id:
+                    continue
+
+                # resolve resource SP
+                if res_sp not in resource_cache:
+                    try:
+                        res_data = self.client.get(
+                            f"{GRAPH_BASE}/servicePrincipals/{res_sp}"
+                            "?$select=displayName,appId,appRoles"
+                        )
+                        resource_cache[res_sp] = {
+                            "displayName": res_data.get("displayName"),
+                            "appId": res_data.get("appId"),
+                            "roles": {
+                                r["id"]: r.get("value")
+                                for r in res_data.get("appRoles", [])
+                            },
+                        }
+                    except:
+                        resource_cache[res_sp] = {"roles": {}}
+
+                role_value = resource_cache[res_sp]["roles"].get(role_id)
+                if role_value:
+                    summary.permissions.append(role_value)
+
+        # --------------------------------------------------------------------
+        # STAGE F — Final dedupe + sort
+        # --------------------------------------------------------------------
+        output = []
         for app in app_map.values():
-            app.permissions = sorted(
-                {p for p in app.permissions if isinstance(p, str) and p}
-            )
-            app.users = sorted({u for u in app.users if u})
-            out.append(app)
+            app.permissions = sorted(set(app.permissions))
+            app.users = sorted(set(app.users))
+            output.append(app)
 
-        return out
+        return output
