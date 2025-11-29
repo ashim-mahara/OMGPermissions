@@ -12,7 +12,13 @@ class Config:
     REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8000/callback")
 
     # Scopes for Microsoft Graph API
-    SCOPES = ["User.Read"]
+    SCOPES = [
+        "User.Read",
+        "User.Read.All",
+        "User.ReadWrite.All",
+        "Directory.Read.All",
+        "Application.Read.All",
+    ]
 
     # Authority URL
     AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
@@ -23,6 +29,8 @@ class Config:
     # Server configuration
     HOST = "localhost"
     PORT = 8000
+
+    POST_LOGOUT_REDIRECT_URI = f"https://google.com/"
 
 
 config = Config()
