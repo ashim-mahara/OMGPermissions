@@ -1,1 +1,1 @@
-# capstone-791
+# Open Microsoft Graph Permissions
